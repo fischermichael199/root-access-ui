@@ -1,0 +1,80 @@
+# Deploy Workflow — root-access-ui
+#
+# Triggered exclusively on merges to main. Downloads the build artefact
+# produced by ci.yml, syncs it to the S3 bucket, and creates a CloudFront
+# cache invalidation so players immediately receive the new version.
+#
+# Authentication uses GitHub OIDC — no long-lived AWS credentials are stored.
+# The IAM role is provisioned by root-access-infrastructure/010-iam.yaml.
+
+name: Deploy
+
+on:
+  workflow_run:
+    # Only run after CI has passed on main.
+    workflows: ["CI"]
+    branches: [main]
+    types: [completed]
+
+# Minimal permissions: id-token is required for OIDC; contents for checkout.
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy to S3 + CloudFront
+    runs-on: ubuntu-latest
+    # Guard: only deploy when the triggering CI workflow succeeded.
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    environment: production
+
+    steps:
+      - name: Download build artefact
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          # Cross-workflow artefact download requires the run ID from the CI job.
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Exchange the GitHub OIDC token for temporary AWS credentials.
+      # The role ARN is stored as a GitHub Actions variable (not a secret),
+      # as role ARNs are not considered sensitive.
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: root-access-ui-deploy
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # Sync the dist/ folder to S3.
+      # Cache-Control headers are set per file type:
+      #   - index.html, sw.js, manifest.webmanifest: no-cache (must always be fresh)
+      #   - assets/* (hashed filenames): 1-year immutable cache
+      - name: Sync assets to S3 — no-cache files
+        run: |
+          aws s3 sync dist/ s3://${{ vars.S3_BUCKET_NAME }}/ \
+            --exclude "assets/*" \
+            --cache-control "no-cache, no-store, must-revalidate" \
+            --delete
+
+      - name: Sync assets to S3 — hashed assets (long cache)
+        run: |
+          aws s3 sync dist/assets/ s3://${{ vars.S3_BUCKET_NAME }}/assets/ \
+            --cache-control "public, max-age=31536000, immutable"
+
+      # Invalidate the CloudFront cache so the new index.html is served immediately.
+      # Only index.html needs invalidation; hashed assets have new URLs on each build.
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ vars.CLOUDFRONT_DISTRIBUTION_ID }} \
+            --paths "/index.html" "/sw.js" "/manifest.webmanifest"
+
+      - name: Deployment complete
+        run: |
+          echo "Deployed to: https://$(aws cloudfront get-distribution \
+            --id ${{ vars.CLOUDFRONT_DISTRIBUTION_ID }} \
+            --query 'Distribution.DomainName' --output text)"
