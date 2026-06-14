@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Vite / TypeScript caches
+*.tsbuildinfo
+.vite/
+
+# PWA dev sw
+dev-dist/
+
+# Editor artifacts
+.DS_Store
+*.swp
+.vscode/
+.idea/
+
+# Environment / secrets
+.env
+.env.local
+.env.*.local
